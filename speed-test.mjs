@@ -1,7 +1,42 @@
-import { performance } from 'node:perf_hooks';
+import { get as httpGet } from 'node:http';
+import { get as httpsGet } from 'node:https';
 
 const REQUEST_COUNT = 10;
 const TIMEOUT_MS = 30_000;
+const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+
+async function download(url, signal, redirectsLeft = 20) {
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('Укажите URL с протоколом HTTP или HTTPS.');
+  }
+  if (url.username || url.password) {
+    throw new Error('Укажите URL без имени пользователя и пароля.');
+  }
+
+  const get = url.protocol === 'https:' ? httpsGet : httpGet;
+  const response = await new Promise((resolve, reject) => {
+    get(url, { signal }, resolve).once('error', reject);
+  });
+
+  const { statusCode, headers } = response;
+  if (REDIRECT_STATUSES.includes(statusCode) && headers.location) {
+    response.destroy();
+    if (redirectsLeft === 0) {
+      throw new Error('Слишком много перенаправлений.');
+    }
+    return download(new URL(headers.location, url), signal, redirectsLeft - 1);
+  }
+  if (statusCode < 200 || statusCode >= 300) {
+    response.destroy();
+    throw new Error(`HTTP ${statusCode}`);
+  }
+
+  let bytes = 0;
+  for await (const chunk of response) {
+    bytes += chunk.length;
+  }
+  return bytes;
+}
 
 async function measure(address) {
   if (!address) {
@@ -9,10 +44,6 @@ async function measure(address) {
   }
 
   const url = new URL(address);
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('Укажите URL с протоколом HTTP или HTTPS.');
-  }
-
   let totalBytes = 0;
   let totalSeconds = 0;
 
@@ -20,22 +51,9 @@ async function measure(address) {
     const startedAt = performance.now();
 
     try {
-      const response = await fetch(url, {
-        headers: { 'Accept-Encoding': 'identity' },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
-
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      for await (const chunk of response.body ?? []) {
-        totalBytes += chunk.byteLength;
-      }
+      totalBytes += await download(url, AbortSignal.timeout(TIMEOUT_MS));
     } catch (error) {
-      const message = error.cause?.message ?? error.message;
-      throw new Error(`Запрос ${attempt} из ${REQUEST_COUNT}: ${message}`);
+      throw new Error(`Запрос ${attempt} из ${REQUEST_COUNT}: ${error.message}`);
     }
 
     totalSeconds += (performance.now() - startedAt) / 1_000;
